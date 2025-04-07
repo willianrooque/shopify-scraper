@@ -3,13 +3,10 @@ const playwright = require("playwright");
 const cors = require("cors");
 
 const app = express();
-app.use(cors()); // Libera CORS para chamadas externas
+app.use(cors());
 
-app.get("/scrape", async (req, res) => {
-  const targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).json({ error: "Parâmetro 'url' é obrigatório." });
-
-  const browser = await playwright.chromium.launch({
+const launchBrowser = async () => {
+  return await playwright.chromium.launch({
     headless: true,
     args: [
       "--no-sandbox",
@@ -17,11 +14,12 @@ app.get("/scrape", async (req, res) => {
       "--disable-blink-features=AutomationControlled",
       "--disable-dev-shm-usage",
       "--disable-gpu",
-      "--window-size=1280,800"
     ],
   });
+};
 
-  const context = await browser.newContext({
+const createContext = async (browser) => {
+  return await browser.newContext({
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     viewport: { width: 1280, height: 800 },
@@ -29,16 +27,20 @@ app.get("/scrape", async (req, res) => {
     bypassCSP: true,
     locale: "pt-BR",
   });
+};
 
+// Rota para raspagem individual
+app.get("/scrape", async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) return res.status(400).json({ error: "Parâmetro 'url' é obrigatório." });
+
+  const browser = await launchBrowser();
+  const context = await createContext(browser);
   const page = await context.newPage();
 
   try {
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-    // Aguarda pelo menos 1 imagem ou título na tela
-    await page.waitForSelector("img", { timeout: 15000 });
-
-    // Scraping com fallback
     const title = await page.title();
 
     const price =
@@ -62,6 +64,67 @@ app.get("/scrape", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Erro ao processar a página",
+      error: error.message,
+    });
+  }
+});
+
+// Rota para coletar todos os produtos da coleção
+app.get("/scrape-collection", async (req, res) => {
+  const collectionUrl = req.query.url;
+  if (!collectionUrl) return res.status(400).json({ error: "Parâmetro 'url' é obrigatório." });
+
+  const browser = await launchBrowser();
+  const context = await createContext(browser);
+  const page = await context.newPage();
+
+  try {
+    await page.goto(collectionUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+    // Coleta os links dos produtos
+    const productLinks = await page.$$eval('a[href*="/products/"]', links => {
+      const urls = links.map(link => link.href);
+      return Array.from(new Set(urls)).slice(0, 100);
+    });
+
+    const products = [];
+
+    for (const url of productLinks) {
+      const productPage = await context.newPage();
+
+      try {
+        await productPage.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+        const title = await productPage.title();
+
+        const price =
+          (await productPage.$eval('[class*="price"]', el => el.innerText).catch(() => null)) ||
+          (await productPage.$eval('[class*="valor"]', el => el.innerText).catch(() => null));
+
+        const image =
+          (await productPage.$eval('img', el => el.src).catch(() => null)) ||
+          (await productPage.$eval('[class*="image"] img', el => el.src).catch(() => null));
+
+        const description =
+          (await productPage.$eval('meta[name="description"]', el => el.content).catch(() => null)) ||
+          (await productPage.$eval('[class*="description"]', el => el.innerText).catch(() => null));
+
+        products.push({ url, title, price, image, description });
+      } catch (err) {
+        products.push({ url, error: "Erro ao raspar este produto" });
+      }
+
+      await productPage.close();
+    }
+
+    await browser.close();
+    return res.json({ success: true, count: products.length, products });
+
+  } catch (error) {
+    await browser.close();
+    return res.status(500).json({
+      success: false,
+      message: "Erro ao acessar a coleção",
       error: error.message,
     });
   }
